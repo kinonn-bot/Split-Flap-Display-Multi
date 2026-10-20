@@ -3,6 +3,7 @@
 #include "CalibrationTriggers.h"
 #include "CsvUtils.h"
 #include "SplitFlapEspNow.h"
+#include "WiredLink.h"
 
 #include <ArduinoJson.h>
 #include <AsyncJson.h>
@@ -10,7 +11,11 @@
 
 bool isMultiDisplayMasterEnabled();
 
-#define AP_SSID "Split Flap Display"
+#define AP_SSID "SFD"
+
+#ifndef AP_CHANNEL
+#define AP_CHANNEL 6
+#endif
 
 #ifndef WIFI_SSID
 #define WIFI_SSID ""
@@ -86,12 +91,161 @@ int SplitFlapWebServer::getMode() {
     return settings.getInt("mode");
 }
 
+namespace {
+
+// Last STA disconnect reason captured by the event handler below. This is the
+// real failure cause when status just sits at 6 (WL_DISCONNECTED).
+uint8_t s_lastWifiDiscReason = 0;
+bool s_haveWifiDiscReason = false;
+bool s_wifiEventHooked = false;
+
+const char *wifiAuthModeName(int auth) {
+    switch (auth) {
+        case 0: return "OPEN";
+        case 1: return "WEP";
+        case 2: return "WPA_PSK";
+        case 3: return "WPA2_PSK";
+        case 4: return "WPA_WPA2_PSK";
+        case 5: return "WPA2_ENTERPRISE";
+        case 6: return "WPA3_PSK";
+        case 7: return "WPA2_WPA3_PSK(mixed)";
+        case 8: return "WAPI_PSK";
+        default: return "?";
+    }
+}
+
+const char *wifiDiscReasonName(uint8_t reason) {
+    switch (reason) {
+        case 1: return "UNSPECIFIED";
+        case 2: return "AUTH_EXPIRE";
+        case 3: return "AUTH_LEAVE";
+        case 4: return "ASSOC_EXPIRE";
+        case 5: return "ASSOC_TOOMANY";
+        case 6: return "NOT_AUTHED";
+        case 7: return "NOT_ASSOCED";
+        case 8: return "ASSOC_LEAVE";
+        case 14: return "MIC_FAILURE";
+        case 15: return "4WAY_HANDSHAKE_TIMEOUT";
+        case 17: return "IE_IN_4WAY_DIFFERS";
+        case 23: return "802_1X_AUTH_FAILED";
+        case 200: return "BEACON_TIMEOUT";
+        case 201: return "NO_AP_FOUND";
+        case 202: return "AUTH_FAIL";
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        case 205: return "CONNECTION_FAIL";
+        default: return "?";
+    }
+}
+
+void ensureWifiEventHandler() {
+    if (s_wifiEventHooked) {
+        return;
+    }
+    s_wifiEventHooked = true;
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+            uint8_t reason = info.wifi_sta_disconnected.reason;
+            uint8_t len = info.wifi_sta_disconnected.ssid_len;
+            if (len > 32) {
+                len = 32;
+            }
+            char ssidBuf[33];
+            memcpy(ssidBuf, info.wifi_sta_disconnected.ssid, len);
+            ssidBuf[len] = '\0';
+            // Our own inter-attempt disconnect() fires an event with an empty
+            // SSID — log it but don't let it overwrite the real failure reason.
+            if (len == 0) {
+                Serial.printf(
+                    "[wifi] event: disconnected (local reset) reason=%u (%s)\n", reason, wifiDiscReasonName(reason)
+                );
+                return;
+            }
+            s_lastWifiDiscReason = reason;
+            s_haveWifiDiscReason = true;
+            Serial.printf(
+                "[wifi] event: disconnected ssid='%s' reason=%u (%s)\n", ssidBuf, reason, wifiDiscReasonName(reason)
+            );
+        }
+    });
+}
+
+// Scan visible networks and pick the strongest BSSID matching `ssid`.
+// Returns its channel, or -1 when the SSID is not visible (5GHz-only,
+// hidden, typo, or out of range). Logs every visible network so the serial
+// log shows whether the target exists at all.
+int findTargetAp(const char *ssid, uint8_t *bssidOut, int *rssiOut, int *authOut) {
+    Serial.println("[wifi] scanning networks...");
+    int n = WiFi.scanNetworks(false, true);
+    if (n < 0) {
+        Serial.println("[wifi] scan failed");
+        return -1;
+    }
+    Serial.printf("[wifi] scan found %d network(s)\n", n);
+    int bestChannel = -1;
+    int bestRssi = -1000;
+    int bestAuth = 0;
+    for (int i = 0; i < n; i++) {
+        String found = WiFi.SSID(i);
+        int rssi = WiFi.RSSI(i);
+        int ch = WiFi.channel(i);
+        int auth = (int) WiFi.encryptionType(i);
+        Serial.printf("[wifi] scan: '%s' rssi=%d ch=%d auth=%d\n", found.c_str(), rssi, ch, auth);
+        if (found == ssid && rssi > bestRssi) {
+            bestRssi = rssi;
+            bestChannel = ch;
+            bestAuth = auth;
+            memcpy(bssidOut, WiFi.BSSID(i), 6);
+        }
+    }
+    WiFi.scanDelete();
+    if (bestChannel > 0) {
+        if (rssiOut) {
+            *rssiOut = bestRssi;
+        }
+        if (authOut) {
+            *authOut = bestAuth;
+        }
+        Serial.printf(
+            "[wifi] target '%s': ch=%d rssi=%d auth=%d/%s bssid=%02x:%02x:%02x:%02x:%02x:%02x\n",
+            ssid,
+            bestChannel,
+            bestRssi,
+            bestAuth,
+            wifiAuthModeName(bestAuth),
+            bssidOut[0],
+            bssidOut[1],
+            bssidOut[2],
+            bssidOut[3],
+            bssidOut[4],
+            bssidOut[5]
+        );
+        if (bestAuth == 7 || bestAuth == 6) {
+            Serial.println(
+                "[wifi] NOTE: AP is WPA3/mixed mode - if auth keeps failing, set the router to WPA2-PSK (AES) only."
+            );
+        }
+    } else {
+        Serial.printf("[wifi] target '%s' NOT in scan (hidden? 5GHz-only? typo? far?)\n", ssid);
+    }
+    return bestChannel;
+}
+
+} // namespace
+
 void SplitFlapWebServer::checkWiFi() {
     if (connectionMode == 1) {
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("Wi-Fi lost! Forcing reconnect...");
-            WiFi.disconnect();
-            WiFi.reconnect();
+            // Throttle reconnect attempts: hammering disconnect()/reconnect()
+            // every check interval (1s) never lets DHCP/4-way handshake finish.
+            const unsigned long kReconnectIntervalMs = 10000;
+            unsigned long now = millis();
+            if (lastWifiReconnectAttempt == 0 || now - lastWifiReconnectAttempt >= kReconnectIntervalMs) {
+                lastWifiReconnectAttempt = now;
+                Serial.printf("[wifi] lost (status=%d), reconnecting...\n", (int) WiFi.status());
+                WiFi.disconnect();
+                WiFi.reconnect();
+            }
         }
     }
 }
@@ -105,10 +259,25 @@ bool SplitFlapWebServer::loadWiFiCredentials() {
         Serial.println("Wi-Fi credentials loaded successfully.");
         Serial.print("Connecting to Network: ");
         Serial.println(ssid);
+        // Clean STA state without powering the radio off: erase any stale
+        // persistent AP config, and keep flash persistence off so a stale
+        // channel/BSSID can't shadow the fresh begin().
+        WiFi.persistent(false);
+        WiFi.disconnect(false, true);
+        delay(300);
         WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(false);
+        WiFi.setSleep(false);
+        WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
+        WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+        WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 #ifdef WIFI_TX_POWER
         delay(100);
         WiFi.setTxPower((wifi_power_t) WIFI_TX_POWER);
+#else
+        // Lower TX power reduces current spikes that brown out the shared 5V
+        // rail on multi-module builds (see README Power/Startup Settings).
+        WiFi.setTxPower(WIFI_POWER_8_5dBm);
 #endif
         WiFi.begin(ssid.c_str(), password.c_str());
         return true; // Return true if credentials exist
@@ -174,16 +343,120 @@ void SplitFlapWebServer::enableOta() {
 }
 
 bool SplitFlapWebServer::connectToWifi() {
-    if (loadWiFiCredentials()) {
+    ensureWifiEventHandler();
+
+    // Allow WIFI_SSID and WIFI_PASS to be overridden by compile-time definitions
+    String ssidStr = String(WIFI_SSID).isEmpty() ? settings.getString("ssid") : String(WIFI_SSID);
+    String passStr = String(WIFI_PASS).isEmpty() ? settings.getString("password") : String(WIFI_PASS);
+    if (ssidStr == "" || passStr == "") {
+        Serial.println("[wifi] no credentials stored");
+        return false;
+    }
+    // Never log the password itself — length only.
+    Serial.printf(
+        "[wifi] credentials: ssid='%s' len=%d passLen=%d%s\n",
+        ssidStr.c_str(),
+        (int) ssidStr.length(),
+        (int) passStr.length(),
+        String(WIFI_SSID).isEmpty() ? "" : " (compile-time override)"
+    );
+    String trimmed = ssidStr;
+    trimmed.trim();
+    if (trimmed != ssidStr) {
+        Serial.println("[wifi] WARNING: ssid has leading/trailing whitespace");
+    }
+
+    // Clean STA state: no radio power-off, erase stale config, no flash
+    // persistence. Keep the driver's own auto-retry OFF while our attempt loop
+    // runs — its background disconnect()+begin() races ours and its local-reset
+    // events leave a stale WL_CONNECT_FAILED behind (observed: attempts 2-4
+    // aborting instantly). Re-enabled only after a successful connect.
+    WiFi.persistent(false);
+    WiFi.setAutoReconnect(false);
+    WiFi.setSleep(false);
+    // Explicit STA search policy (must precede begin): scan every channel,
+    // prefer strongest signal, require at least WPA2 for secured networks.
+    WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+    WiFi.mode(WIFI_STA);
+#ifdef WIFI_TX_POWER
+    delay(100);
+    WiFi.setTxPower((wifi_power_t) WIFI_TX_POWER);
+#else
+    // Lower TX power reduces current spikes that brown out the shared 5V
+    // rail on multi-module builds (see README Power/Startup Settings).
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+#endif
+    delay(300);
+
+    // One scan up front: shows whether the SSID is visible at all and pins
+    // the strongest 2.4GHz BSSID/channel, which fixes flaky connects on
+    // multi-AP / band-steered networks.
+    uint8_t targetBssid[6] = {0, 0, 0, 0, 0, 0};
+    int targetRssi = 0;
+    int targetAuth = 0;
+    int targetChannel = findTargetAp(ssidStr.c_str(), targetBssid, &targetRssi, &targetAuth);
+
+    static const int kMaxAttempts = 4;
+    static const unsigned long kAttemptTimeoutMs = 15000; // per-attempt wait
+    for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
+        s_haveWifiDiscReason = false;
+        // First two attempts use the scan-pinned BSSID/channel (best for
+        // multi-AP / band-steered networks); later attempts fall back to a
+        // full unpinned begin, which some WPA2/WPA3-mixed APs prefer.
+        bool pinned = (targetChannel > 0 && attempt <= 2);
+        if (attempt >= 3) {
+            // Full radio reset before fallback attempts.
+            WiFi.mode(WIFI_OFF);
+            delay(500);
+            WiFi.mode(WIFI_STA);
+            WiFi.setAutoReconnect(false);
+            WiFi.setSleep(false);
+            WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
+            WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+            WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+#ifdef WIFI_TX_POWER
+            delay(100);
+            WiFi.setTxPower((wifi_power_t) WIFI_TX_POWER);
+#else
+            WiFi.setTxPower(WIFI_POWER_8_5dBm);
+#endif
+            delay(300);
+        } else {
+            WiFi.disconnect(false, true);
+            delay(300);
+        }
+        if (pinned) {
+            Serial.printf(
+                "[wifi] attempt %d/%d: begin ch=%d rssi=%d (pinned)...\n",
+                attempt,
+                kMaxAttempts,
+                targetChannel,
+                targetRssi
+            );
+            WiFi.begin(ssidStr.c_str(), passStr.c_str(), targetChannel, targetBssid);
+        } else {
+            Serial.printf("[wifi] attempt %d/%d: begin (unpinned)...\n", attempt, kMaxAttempts);
+            WiFi.begin(ssidStr.c_str(), passStr.c_str());
+        }
+        delay(500); // let the driver start before polling status()
         unsigned long startAttemptTime = millis();
-        const unsigned long timeout = 20000; // 20 seconds
         unsigned long lastPrintTime = startAttemptTime;
 
+        // NOTE: no fail-fast on WiFi.status() here. Status can still hold the
+        // previous attempt's terminal value (or the driver's own local-reset
+        // event), which aborted attempts 2-4 instantly in testing. Only the
+        // live disconnect-event reason is trustworthy, and only AUTH_FAIL /
+        // NO_AP_FOUND are definitive enough to cut an attempt short.
         while (WiFi.status() != WL_CONNECTED) {
-            if (millis() - startAttemptTime >= timeout) {
-                Serial.println("_");
-                Serial.println("Wi-Fi connection failed! Timeout reached.");
-                return false; // Return false if unable to connect in 30 seconds
+            if (s_haveWifiDiscReason && (s_lastWifiDiscReason == 202 || s_lastWifiDiscReason == 201)) {
+                Serial.println();
+                break;
+            }
+            if (millis() - startAttemptTime >= kAttemptTimeoutMs) {
+                Serial.println();
+                break;
             }
             if ((millis() - lastPrintTime) > 1000) {
                 Serial.print(".");
@@ -192,31 +465,98 @@ bool SplitFlapWebServer::connectToWifi() {
             yield();
         }
 
-        // connected succesfully
-        connectionMode = 1;
-        WiFi.softAPdisconnect(); // Turns off SoftAP mode only after connected to
-        // actual network
-        WiFi.setAutoReconnect(true);
-        WiFi.persistent(true); // Saves Wi-Fi settings to flash memory
-        WiFi.setSleep(false);
-        Serial.println("Connected to Wi-Fi!");
-        Serial.println("IP Address: http://" + WiFi.localIP().toString());
-        return true;
+        if (WiFi.status() == WL_CONNECTED) {
+            // connected succesfully
+            connectionMode = 1;
+            WiFi.softAPdisconnect(); // Turns off SoftAP mode only after connected to
+            // actual network
+            WiFi.setAutoReconnect(true);
+            WiFi.setSleep(false);
+            Serial.printf(
+                "\n[wifi] connected! ip=%s rssi=%d ch=%d\n",
+                WiFi.localIP().toString().c_str(),
+                WiFi.RSSI(),
+                WiFi.channel()
+            );
+            return true;
+        }
+
+        Serial.printf("[wifi] attempt %d failed (status=%d", attempt, (int) WiFi.status());
+        if (s_haveWifiDiscReason) {
+            Serial.printf(" reason=%u/%s", s_lastWifiDiscReason, wifiDiscReasonName(s_lastWifiDiscReason));
+        }
+        Serial.printf(")%s\n", attempt < kMaxAttempts ? " Retrying..." : "");
+        // Definitive failures: retrying the same credentials cannot succeed.
+        if (s_haveWifiDiscReason && s_lastWifiDiscReason == 202) {
+            Serial.println(
+                "[wifi] AUTH_FAIL: password rejected. Fix via the SFD AP portal settings page, " "then reboot. Aborting remaining attempts."
+            );
+            WiFi.disconnect(false, true);
+            return false;
+        }
+        if (s_haveWifiDiscReason && s_lastWifiDiscReason == 201) {
+            Serial.println(
+                "[wifi] NO_AP_FOUND: SSID vanished after scan - check 2.4GHz band / hidden SSID. " "Aborting remaining attempts."
+            );
+            WiFi.disconnect(false, true);
+            return false;
+        }
+        if (s_haveWifiDiscReason && s_lastWifiDiscReason == 2) {
+            Serial.println(
+                "[wifi] hint: AUTH_EXPIRE - AP dropped auth. Re-enter the password via the SFD AP " "portal to rule out a typo; if the AP is WPA2/WPA3 mixed (see auth= above), set it " "to WPA2-PSK/AES only."
+            );
+        } else if (s_haveWifiDiscReason && (s_lastWifiDiscReason == 15 || s_lastWifiDiscReason == 204)) {
+            Serial.println("[wifi] hint: handshake timeout - wrong password or WPA2/WPA3/PMF mismatch.");
+        } else if (s_haveWifiDiscReason && s_lastWifiDiscReason == 200) {
+            Serial.println("[wifi] hint: BEACON_TIMEOUT - weak signal or interference, move closer.");
+        }
+
+        // Back off briefly before the next begin() so the radio/AP can settle.
+        WiFi.disconnect(false, true);
+        delay(1000 * attempt);
     }
+
+    Serial.println("[wifi] all attempts exhausted");
+    Serial.println(
+        "[wifi] isolate: phone 2.4GHz hotspot with simple SSID/pass. Hotspot OK => router config " "(WPA mode/password); hotspot fails too => board power/RF issue."
+    );
     return false;
 }
 
 void SplitFlapWebServer::startAccessPoint() {
     connectionMode = 0;
     const char *apSSID = AP_SSID;
-    WiFi.softAP(apSSID);
+    // A failed station attempt leaves the radio in WIFI_STA mid-scan
+    // (WiFi.begin keeps retrying in the background). Stop it and switch to
+    // AP mode explicitly — otherwise softAP() can fail silently while we
+    // print "AP Mode Started!" unconditionally (observed: success log +
+    // default 192.168.4.1, but no beacons on air).
+    WiFi.disconnect(true);
+    WiFi.setAutoReconnect(false);
+    WiFi.mode(WIFI_AP);
+    delay(200);
+    // Explicit channel/visibility/max-clients: pin them so a core-version
+    // default change can't silently hide the AP. Channel 6 avoids the
+    // crowded channel 1 default used by many routers.
+    bool apUp = WiFi.softAP(apSSID, nullptr, AP_CHANNEL, 0, 4);
+    if (! apUp) {
+        Serial.println("AP start failed, retrying...");
+        delay(500);
+        apUp = WiFi.softAP(apSSID, nullptr, AP_CHANNEL, 0, 4);
+    }
+    if (! apUp) {
+        Serial.println("AP Mode FAILED to start!");
+        return;
+    }
 #ifdef WIFI_TX_POWER
     delay(100);
     WiFi.setTxPower((wifi_power_t) WIFI_TX_POWER);
 #endif
     Serial.println("AP Mode Started!");
     Serial.println("Connect to: " + String(apSSID));
-    Serial.println("AP IP Address: http://" + WiFi.softAPIP().toString());
+    Serial.printf(
+        "[wifi] mode=%d apChannel=%d ip=%s\n", (int) WiFi.getMode(), WiFi.channel(), WiFi.softAPIP().toString().c_str()
+    );
 }
 
 void fourOhFour(AsyncWebServerRequest *request) {
@@ -268,10 +608,16 @@ void SplitFlapWebServer::startWebServer() {
         response["settings"] = currentSettings.as<JsonObject>();
         response["localMac"] = WiFi.macAddress();
         response["schemaVersion"] = SETTINGS_SCHEMA_VERSION;
-        if (espNow) {
+        String peersJson = "";
+        if (settings.getInt("linkTransport") != 0 && wired) {
+            peersJson = wired->getDiscoveredPeersJson();
+        } else if (espNow) {
+            peersJson = espNow->getDiscoveredPeersJson();
+        }
+        if (peersJson.length() > 0) {
             JsonArray peers = response["discoveredPeers"].to<JsonArray>();
             JsonDocument peersDoc;
-            deserializeJson(peersDoc, espNow->getDiscoveredPeersJson());
+            deserializeJson(peersDoc, peersJson);
             for (JsonObject peer : peersDoc.as<JsonArray>()) {
                 peers.add(peer);
             }
@@ -291,9 +637,8 @@ void SplitFlapWebServer::startWebServer() {
         this->attemptReconnect = true;
     });
 
-    server.addHandler(new AsyncCallbackJsonWebHandler(
-        "/settings",
-        [this](AsyncWebServerRequest *request, JsonVariant &json) {
+    server.addHandler(
+        new AsyncCallbackJsonWebHandler("/settings", [this](AsyncWebServerRequest *request, JsonVariant &json) {
         if (request->method() != HTTP_POST) {
             return request->send(405, "application/json", "{\"error\":\"Method Not Allowed\"}");
         }
@@ -326,8 +671,8 @@ void SplitFlapWebServer::startWebServer() {
             response["redirect"] = "http://" + json["mdns"].as<String>() + ".local/settings.html";
         }
 
-        if ((json["mqtt_server"].is<String>() && json["mqtt_server"].as<String>() != settings.getString("mqtt_server")
-            ) ||
+        if ((json["mqtt_server"].is<String>() &&
+             json["mqtt_server"].as<String>() != settings.getString("mqtt_server")) ||
             (json["mqtt_port"].is<int>() && json["mqtt_port"].as<int>() != settings.getInt("mqtt_port")) ||
             (json["mqtt_user"].is<String>() && json["mqtt_user"].as<String>() != settings.getString("mqtt_user")) ||
             (json["mqtt_pass"].is<String>() && json["mqtt_pass"].as<String>() != settings.getString("mqtt_pass"))) {
@@ -354,6 +699,19 @@ void SplitFlapWebServer::startWebServer() {
         }
         const char *hardwareIntKeys[] = {"moduleCount", "stepsPerRot", "charset", "sdaPin", "sclPin"};
         for (const char *k : hardwareIntKeys) {
+            if (json[k].is<int>() || json[k].is<float>() || json[k].is<String>()) {
+                if (json[k].as<int>() != settings.getInt(k)) {
+                    hardwareChanged = true;
+                    break;
+                }
+            }
+        }
+        // Inter-display link transport, address, pins and baud are
+        // snapshotted in WiredLink::init() at boot, while dispatch reads the
+        // live setting — changing them without a reboot would route messages
+        // to an uninitialized transport. Flag a reboot like other hardware.
+        const char *linkIntKeys[] = {"linkTransport", "linkAddress", "linkTxPin", "linkRxPin", "linkBaud"};
+        for (const char *k : linkIntKeys) {
             if (json[k].is<int>() || json[k].is<float>() || json[k].is<String>()) {
                 if (json[k].as<int>() != settings.getInt(k)) {
                     hardwareChanged = true;
@@ -429,7 +787,7 @@ void SplitFlapWebServer::startWebServer() {
             pendingActions_.requestReloadOffsets();
             response["message"] = "Settings saved, offsets will be applied";
 
-            if (! isMultiDisplayMasterEnabled() && espNow) {
+            if (! isMultiDisplayMasterEnabled() && (espNow || wired)) {
                 pendingActions_.requestReportOffsets();
             }
         }
@@ -455,11 +813,11 @@ void SplitFlapWebServer::startWebServer() {
 
         this->rebootRequired = rebootRequired;
         this->attemptReconnect = reconnect;
-    }
-    ));
+    })
+    );
 
-    server
-        .addHandler(new AsyncCallbackJsonWebHandler("/text", [this](AsyncWebServerRequest *request, JsonVariant &json) {
+    server.addHandler(
+        new AsyncCallbackJsonWebHandler("/text", [this](AsyncWebServerRequest *request, JsonVariant &json) {
         if (request->method() != HTTP_POST) {
             return request->send(405, "application/json", "{\"error\":\"Method Not Allowed\"}");
         }
@@ -535,7 +893,8 @@ void SplitFlapWebServer::startWebServer() {
         response["type"] = "success";
 
         request->send(200, "application/json", response.as<String>());
-    }));
+    })
+    );
 
     server.onNotFound(fourOhFour);
 
@@ -592,6 +951,66 @@ bool SplitFlapWebServer::validateMasterSettings(JsonVariant &json, JsonDocument 
         response["errors"]["key"] = "masterGroupCount";
         response["errors"]["message"] = "Enter a value from 1 to 6";
         return false;
+    }
+
+    // Inter-display link transport bounds: the web UI clamps these, but
+    // POST /api/settings must also reject them — otherwise an invalid combo
+    // (e.g. Direct UART with 6 groups) persists and WiredLink::init()
+    // refuses it at the next boot.
+    int linkTransport = settings.getInt("linkTransport");
+    if (! json["linkTransport"].isNull()) {
+        if (! json["linkTransport"].is<int>()) {
+            response["message"] = "Link transport must be a number";
+            response["type"] = "error";
+            response["errors"]["key"] = "linkTransport";
+            response["errors"]["message"] = "Enter 0 for ESP-NOW, 1 for RS-485, 2 for Direct UART";
+            return false;
+        }
+        linkTransport = json["linkTransport"].as<int>();
+    }
+
+    const char *linkError = validateWiredSettings(linkTransport, groupCount);
+    if (linkError != nullptr) {
+        response["message"] = linkError;
+        response["type"] = "error";
+        response["errors"]["key"] = json["masterGroupCount"].isNull() ? "linkTransport" : "masterGroupCount";
+        response["errors"]["message"] = linkError;
+        return false;
+    }
+
+    if (! json["linkAddress"].isNull()) {
+        if (! json["linkAddress"].is<int>()) {
+            response["message"] = "Wired address must be a number";
+            response["type"] = "error";
+            response["errors"]["key"] = "linkAddress";
+            response["errors"]["message"] = "Enter a value from 0 to 5";
+            return false;
+        }
+        int linkAddress = json["linkAddress"].as<int>();
+        if (linkAddress < 0 || linkAddress >= LINK_MAX_GROUPS) {
+            response["message"] = "Wired address must be between 0 and 5";
+            response["type"] = "error";
+            response["errors"]["key"] = "linkAddress";
+            response["errors"]["message"] = "Use 0 for the master, 1-5 for a remote group slot";
+            return false;
+        }
+    }
+
+    if (! json["linkBaud"].isNull()) {
+        if (! json["linkBaud"].is<int>()) {
+            response["message"] = "Baud rate must be a number";
+            response["type"] = "error";
+            response["errors"]["key"] = "linkBaud";
+            response["errors"]["message"] = "Enter a baud rate of at least 1200";
+            return false;
+        }
+        if (json["linkBaud"].as<int>() < 1200) {
+            response["message"] = "Baud rate is too low";
+            response["type"] = "error";
+            response["errors"]["key"] = "linkBaud";
+            response["errors"]["message"] = "Enter a baud rate of at least 1200";
+            return false;
+        }
     }
 
     String moduleCounts = settings.getString("masterGroupModuleCounts");

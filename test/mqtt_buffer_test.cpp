@@ -16,6 +16,8 @@
 #include "JsonSettings.h"
 #include "PubSubClient.h"
 #include "SplitFlapMqtt.h"
+#include "WiFi.h"
+#include "WiredLink.h"
 
 // Stub globals (same pattern as jsonsettings_test.cpp)
 std::vector<std::string> g_serialLines;
@@ -29,6 +31,8 @@ extern int g_publishCalls;
 extern PubSubClient *g_lastClient;
 extern int g_distributeCalls;
 extern std::string g_lastDistributed;
+extern int g_wiredDistributeCalls;
+extern std::string g_lastWiredDistributed;
 extern int g_writeStringCalls;
 extern std::string g_lastWritten;
 extern float g_lastWriteSpeed;
@@ -56,6 +60,7 @@ static std::map<String, JsonSetting> testSchema() {
         {"scrollDelayMs", JsonSetting(1500)},
         {"scrollRepeatCount", JsonSetting(2)},
         {"masterGroupCount", JsonSetting(1)},
+        {"linkTransport", JsonSetting(0)},
         {"maxVel", JsonSetting(15.0f)},
         {"moduleCount", JsonSetting(8)},
     };
@@ -134,6 +139,24 @@ int main() {
         CHECK(g_lastDistributed == "fleet message");
         CHECK(g_writeStringCalls == 0); // multi-group: no local writeString
         CHECK(g_publishCalls >= 1);     // state topic still published
+
+        // Wired branch: linkTransport != 0 routes the fleet message via the
+        // wired object — never via ESP-NOW, never via a local writeString.
+        g_distributeCalls = 0;
+        g_wiredDistributeCalls = 0;
+        g_lastWiredDistributed = "";
+        g_writeStringCalls = 0;
+        settings.putInt("linkTransport", 2);
+        settings.putInt("masterGroupCount", 2);
+        SplitFlapWired wired(settings, display);
+        mqtt.setWired(&wired);
+        byte payload3[] = "wired fleet";
+        g_lastClient->deliver(topic, payload3, 11);
+        mqtt.loop();
+        CHECK(g_wiredDistributeCalls == 1);
+        CHECK(g_lastWiredDistributed == "wired fleet");
+        CHECK(g_distributeCalls == 0);
+        CHECK(g_writeStringCalls == 0);
     }
 
     // RED for issue #21 (audit): connect() must register a retained
@@ -163,6 +186,34 @@ int main() {
         CHECK(g_lastClient->willTopic() == "splitflap/splitflap/availability");
         CHECK(g_lastClient->willMessage() == "offline");
         CHECK(g_lastClient->willRetain() == true);
+    }
+
+    // AP fallback mode has no uplink: loop() must not attempt broker
+    // connects (log spam + needless radio traffic while the user
+    // configures Wi-Fi), but must still drain staged /set commands.
+    {
+        extern wifi_mode_t g_wifiMode;
+        g_wifiMode = WIFI_AP;
+
+        JsonSettings settings("mqttaptest", testSchema());
+        WiFiClient wifiClient;
+        SplitFlapDisplay display(settings);
+        SplitFlapMqtt mqtt(settings, wifiClient);
+        mqtt.setDisplay(&display);
+        mqtt.setup();
+        g_lastClient->forceConnected(false);
+
+        int connectsBefore = g_lastClient->connectCalls();
+        char topic[] = "splitflap/splitflap/set";
+        byte payload[] = "ap staged";
+        g_lastClient->deliver(topic, payload, 9);
+        g_writeStringCalls = 0;
+        mqtt.loop();
+        CHECK(g_lastClient->connectCalls() == connectsBefore); // no connect attempt
+        CHECK(g_writeStringCalls == 1);                        // staged command still drains
+        CHECK(g_lastWritten == "ap staged");
+
+        g_wifiMode = WIFI_STA; // restore for any later tests
     }
 
     std::printf("%d checks, %d failures\n", checks, failures);
